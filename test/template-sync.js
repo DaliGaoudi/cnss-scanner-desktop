@@ -46,6 +46,7 @@ const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 //   mode ok    → normal
 //   mode error → every template call answers 500
 //   mode gone  → every template call answers 410 moved
+//   mode nopush → /api/templates/push answers 404 (an older / rolled-back server)
 let mode = 'ok';
 const store = { act: null, list: null };
 let calls = [];           // [{ url, body }]
@@ -61,6 +62,7 @@ const fake = http.createServer((req, res) => {
         if (!req.url.startsWith('/api/templates/')) return send(404, {});
         calls.push({ url: req.url, body });
         if (mode === 'error') return send(500, { error: 'boom' });
+        if (mode === 'nopush' && req.url === '/api/templates/push') return send(404, { error: 'Not found' });
         if (mode === 'gone') return send(410, { movedToCloud: true, cloudUrl: 'https://c.tn' });
         if (!body.token || !body.fingerprint) return send(400, { error: 'no auth' });
         if (req.url === '/api/templates/push') {
@@ -384,6 +386,35 @@ test('a confirmed push remembers what the server now holds', async () => {
     rm(ACT());
     await tpl().pushKind('act');
     assert.strictEqual(syncedSha('act'), null);
+});
+
+test('a 404 on push (no such route) is not a confirmed push: lastSyncedSha unchanged', async () => {
+    reset(); fs.writeFileSync(ACT(), A);
+    mode = 'nopush';
+    await tpl().pushKind('act');                       // never synced → still undefined
+    assert.strictEqual(syncedSha('act'), undefined);
+    setSynced('act', B); store.act = B;                // had agreed on B; now A is an unpushed change
+    await tpl().pushKind('act');
+    assert.strictEqual(syncedSha('act'), sha(B), 'not recorded as synced');
+    const r = await tpl().syncOnLaunch();               // launch upload also gets the 404
+    assert.deepStrictEqual(r.uploaded, []);
+    assert.strictEqual(syncedSha('act'), sha(B));
+    assert.ok(eq(read(ACT()), A), 'local untouched');
+});
+
+test('after the push route appears, the next launch uploads and does not delete', async () => {
+    reset(); fs.writeFileSync(ACT(), A);
+    mode = 'nopush';
+    await tpl().pushKind('act');                       // the server without the route: not recorded
+    await tpl().syncOnLaunch();                         // backfill upload also refused
+    assert.strictEqual(syncedSha('act'), undefined);
+    mode = 'ok';                                        // the routes exist now (server rolled forward)
+    const r = await tpl().syncOnLaunch();
+    assert.deepStrictEqual(r, { downloaded: [], uploaded: ['act'], deleted: [] });
+    assert.ok(eq(read(ACT()), A), 'the template was not unlinked');
+    assert.ok(eq(store.act, A));
+    assert.strictEqual(syncedSha('act'), sha(A));
+    assert.strictEqual(backups().length, 0);
 });
 
 // ── the Word-import routes ──

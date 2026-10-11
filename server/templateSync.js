@@ -116,7 +116,7 @@ async function pushKindNow(kind) {
     if (!c) return;
     const buf = readLocal(kind);
     try {
-        await call(c, 'push', { kind, docxBase64: buf ? buf.toString('base64') : null });
+        await pushToServer(c, kind, buf);
         setLastSynced(kind, buf ? sha256(buf) : null); // confirmed: the server has exactly this
     } catch (e) { /* not confirmed: the remembered sha stays, so the next launch pushes it again */ }
 }
@@ -147,9 +147,16 @@ async function takeServer(c, kind, meta, out) {
     return true;
 }
 
+// POST a push. Only a 2xx confirms it: a 404 (call() maps it to null) means the server
+// has no such route (older/rolled-back server, custom URL), so nothing was stored.
+async function pushToServer(c, kind, buf) {
+    const r = await call(c, 'push', { kind, docxBase64: buf ? buf.toString('base64') : null });
+    if (r === null) throw new Error('push not confirmed: the server has no templates/push route');
+}
+
 // Send the local state up: its bytes, or null when the local file is absent.
 async function sendLocal(c, kind, local, out) {
-    await call(c, 'push', { kind, docxBase64: local ? local.toString('base64') : null });
+    await pushToServer(c, kind, local);
     setLastSynced(kind, local ? sha256(local) : null);
     out.uploaded.push(kind);
 }

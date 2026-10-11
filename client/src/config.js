@@ -11,8 +11,10 @@ export const MOVED_EVENT = 'cnss:moved-to-cloud';
 
 // The calls the shell itself makes to learn the licence state. They must NEVER
 // signal: the gate reload (/onboarding/status) is itself answered 423 while
-// moved, so signalling on it would loop forever; /license/* is exempt on the
-// server and is how the cloud screen asks about an undo.
+// moved, so signalling on it would loop forever. The server only exempts
+// /license/status and /license/refresh from its 423 (that is how the cloud screen
+// asks about an undo); every other /license/* call is never signalled here either,
+// because the shell makes those itself and handles their answers.
 const NO_SIGNAL = [`${API_BASE}/onboarding/status`, `${API_BASE}/license/`];
 
 // Pure decision: should this response make the shell re-read the gate?
