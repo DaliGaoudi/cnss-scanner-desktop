@@ -4,12 +4,13 @@ import { LogOut, Sun, Moon, ScanLine, Settings as SettingsIcon, Hourglass, KeyRo
 import WordImport from './components/WordImport';
 import './index.css';
 
-import API_BASE from './config';
+import API_BASE, { MOVED_EVENT } from './config';
 import RegistreCNSS from './pages/RegistreCNSS';
 import RegistreCNSSDetail from './pages/RegistreCNSSDetail';
 import Settings from './pages/Settings';
 import FacturationCNSS from './pages/FacturationCNSS';
 import Activation from './pages/Activation';
+import CloudMoved from './pages/CloudMoved';
 import Onboarding from './pages/Onboarding';
 import UpdateBanner from './components/UpdateBanner';
 
@@ -396,12 +397,23 @@ export default function App() {
 
   const loadGate = useCallback(() => {
     fetch(`${API_BASE}/onboarding/status`)
-      .then((r) => r.json()).then(setGate)
+      // Moved to the cloud: the local API answers 423 here too, but the licence
+      // status stays open and says where the office went.
+      .then((r) => (r.status === 423
+        ? fetch(`${API_BASE}/license/status`).then((l) => l.json()).then((license) => ({ activated: false, onboardingDone: true, license }))
+        : r.json()))
+      .then(setGate)
       // Only the very first load falls back to "not activated"; a failed
       // periodic re-check keeps whatever we last knew.
       .catch(() => setGate((prev) => prev || { activated: false, onboardingDone: false }));
   }, []);
   useEffect(() => { loadGate(); }, [loadGate]);
+
+  // Any API call answered 423 (the office moved while a window was open): re-read the gate now.
+  useEffect(() => {
+    window.addEventListener(MOVED_EVENT, loadGate);
+    return () => window.removeEventListener(MOVED_EVENT, loadGate);
+  }, [loadGate]);
 
   // Re-read the licence every few minutes: a trial that runs out while the app
   // is open locks on time, and the banner's countdown stays current. Cheap —
@@ -440,6 +452,8 @@ export default function App() {
             <div className="login-container">
               <div className="glass login-card" dir="rtl" style={{ textAlign: 'center', opacity: 0.7 }}>جاري التحميل…</div>
             </div>
+          ) : gate.license && gate.license.reason === 'moved_to_cloud' ? (
+            <CloudMoved license={gate.license} onUnlocked={loadGate} />
           ) : !gate.activated ? (
             <Activation onActivated={loadGate} license={gate.license} />
           ) : !gate.onboardingDone ? (
