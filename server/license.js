@@ -61,12 +61,17 @@ function fingerprint() {
 // The provider moved this office to the web app. We keep the key and token (so an
 // undo unlocks on the next good validate) and only record where the office went.
 // Local files are never touched.
-function markMoved({ url, at, providerContact } = {}) {
+// Only an https cloud link is ever kept: the lock holds, but a non-https url
+// (a typo, a hostile server answer) gets no open button.
+const isHttps = (u) => typeof u === 'string' && /^https:\/\//i.test(u);
+function markMoved({ url, at, providerContact, licenseKey } = {}) {
     const lic = load();
     const prev = lic.movedToCloud || {};
     save({
         ...lic,
-        movedToCloud: { url: url || prev.url || '', at: at || prev.at || new Date().toISOString() },
+        // keep the typed key so a PC that never got a token can retry activation after an undo
+        licenseKey: lic.licenseKey || licenseKey || '',
+        movedToCloud: { url: [url, prev.url].find(isHttps) || '', at: at || prev.at || new Date().toISOString() },
         providerContact: providerContact || lic.providerContact || '',
     });
 }
@@ -134,8 +139,8 @@ async function activate(licenseKey) {
     });
     const d = await res.json().catch(() => ({}));
     if (res.status === 403 && d.reason === 'moved_to_cloud') {
-        markMoved({ url: d.cloudUrl, at: d.movedAt, providerContact: d.providerContact });
-        throw new Error(`تم نقل مكتبكم إلى السحابة. افتحوا التطبيق على: ${d.cloudUrl || ''}`.trim());
+        markMoved({ url: d.cloudUrl, at: d.movedAt, providerContact: d.providerContact, licenseKey: String(licenseKey || '').trim() });
+        throw new Error(`تم نقل مكتبكم إلى السحابة. ${isHttps(d.cloudUrl) ? 'افتحوا التطبيق على: ' + d.cloudUrl : 'تواصلوا مع المزوّد.'}`);
     }
     if (!res.ok) throw new Error(d.error || 'فشل التفعيل. تحقّق من المفتاح والاتصال بالإنترنت.');
     save({
@@ -156,7 +161,18 @@ async function activate(licenseKey) {
 // Never throws; offline or 5xx keeps the current token (grace until it expires).
 async function revalidate() {
     const lic = load();
-    if (!lic.token) return;
+    if (!lic.token) {
+        // Moved before this PC ever got a token (activation was refused): after an
+        // undo only a fresh activation can unlock it. 403 moved keeps it locked;
+        // offline or any other failure leaves everything as it was.
+        if (lic.licenseKey && lic.movedToCloud) {
+            try {
+                await activate(lic.licenseKey);
+                try { require('./sync').resume(); } catch (e) { /* best-effort */ }
+            } catch (e) { /* still moved / offline / refused: unchanged */ }
+        }
+        return;
+    }
     try {
         const res = await fetch(`${serverUrl()}/api/validate`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },

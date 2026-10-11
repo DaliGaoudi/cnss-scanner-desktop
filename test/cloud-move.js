@@ -33,6 +33,7 @@ const token = jwt.sign({ typ: 'activation', lic: LICENCE, fp: license.fingerprin
 //   moved  → validate 403 moved_to_cloud
 //   gone   → validate 200, push 410
 let mode = 'ok';
+let cloudUrl = CLOUD; // what the stand-in announces as the cloud address
 const calls = [];
 const pushCount = () => calls.filter((c) => c === '/api/data/push').length;
 const fake = http.createServer((req, res) => {
@@ -42,12 +43,13 @@ const fake = http.createServer((req, res) => {
         const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
         if (req.url === '/api/validate') {
             if (mode === 'moved') {
-                return send(403, { ok: false, reason: 'moved_to_cloud', cloudUrl: CLOUD, movedAt: '2026-10-11T10:00:00.000Z', providerContact: '+216 29 484 700' });
+                return send(403, { ok: false, reason: 'moved_to_cloud', cloudUrl, movedAt: '2026-10-11T10:00:00.000Z', providerContact: '+216 29 484 700' });
             }
             return send(200, { ok: true, token, providerContact: '+216 29 484 700' });
         }
         if (req.url === '/api/activate') {
-            return send(403, { ok: false, reason: 'moved_to_cloud', cloudUrl: CLOUD, movedAt: '2026-10-11T10:00:00.000Z', error: 'x' });
+            if (mode !== 'moved') return send(200, { ok: true, token, providerContact: '+216 29 484 700' });
+            return send(403, { ok: false, reason: 'moved_to_cloud', cloudUrl, movedAt: '2026-10-11T10:00:00.000Z', error: 'x' });
         }
         if (req.url === '/api/data/push') {
             return mode === 'gone' ? send(410, { movedToCloud: true, cloudUrl: CLOUD }) : send(200, { ok: true, version: 1 });
@@ -167,11 +169,66 @@ test('a moved office that was 410-locked unlocks and resumes after the undo (fla
 });
 
 test('activation refused with 403 moved_to_cloud saves the moved state and explains where to go', async () => {
-    fs.writeFileSync(path.join(DATA, 'license.json'), JSON.stringify({ licenseKey: LICENCE, token }));
+    fs.writeFileSync(path.join(DATA, 'license.json'), '{}'); // a PC that never got a token
     mode = 'moved';
     await assert.rejects(() => license.activate(LICENCE), (e) => e.message.includes(CLOUD));
     assert.strictEqual(license.isMoved().url, CLOUD);
     assert.strictEqual(license.getStatus().reason, 'moved_to_cloud');
+    assert.strictEqual(license.load().licenseKey, LICENCE, 'the typed key is kept for the retry');
+    assert.ok(!license.load().token, 'still no token');
+});
+
+test('activate-only PC: refresh while the server is down changes nothing', async () => {
+    const port = fake.address().port;
+    await unlisten();
+    const r = await local('POST', '/api/license/refresh');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.reason, 'moved_to_cloud');
+    assert.strictEqual(license.isMoved().url, CLOUD);
+    await listen(port);
+});
+
+test('activate-only PC: refresh while still moved stays locked', async () => {
+    mode = 'moved';
+    const r = await local('POST', '/api/license/refresh');
+    assert.strictEqual(r.body.reason, 'moved_to_cloud');
+    assert.strictEqual(r.body.activated, false);
+    assert.ok(!license.load().token);
+});
+
+test('activate-only PC: after the admin undoes the move, refresh unlocks it and pushing can resume', async () => {
+    mode = 'ok';
+    const r = await local('POST', '/api/license/refresh');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.activated, true);
+    assert.strictEqual(license.isMoved(), null);
+    assert.ok(license.load().token, 'got a token by activating again');
+    assert.strictEqual(license.load().licenseKey, LICENCE);
+    const before = pushCount();
+    await sync().push();
+    assert.strictEqual(pushCount(), before + 1, 'push request is made again');
+    assert.strictEqual((await local('GET', '/api/settings/public')).status, 200, 'local API open again');
+});
+
+test('only an https cloud link is kept: the lock holds but there is no link to open', async () => {
+    for (const bad of ['http://evil.example', 'javascript:alert(1)', 'ftp://x.tn', '//x.tn', '']) {
+        cloudUrl = bad;
+        mode = 'moved';
+        await license.revalidate();
+        assert.ok(license.isMoved(), 'still locked for ' + JSON.stringify(bad));
+        assert.strictEqual(license.isMoved().url, '', 'no link kept for ' + JSON.stringify(bad));
+        assert.strictEqual((await local('GET', '/api/cnss')).body.cloudUrl, '');
+        mode = 'ok';
+        await license.revalidate();
+        assert.strictEqual(license.isMoved(), null);
+    }
+    cloudUrl = CLOUD;
+    license.markMoved({ url: 'HTTPS://c.tn' });
+    assert.strictEqual(license.isMoved().url, 'HTTPS://c.tn', 'https in any case is fine');
+    license.markMoved({ url: 'http://evil.example' });
+    assert.strictEqual(license.isMoved().url, 'HTTPS://c.tn', 'a later non-https answer does not replace a good link');
+    license.clearMoved();
+    assert.strictEqual(license.isMoved(), null);
 });
 
 const { startServer } = require('../server/index.js');

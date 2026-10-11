@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, createContext, useContext } from 'react';
+import { useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { LogOut, Sun, Moon, ScanLine, Settings as SettingsIcon, Hourglass, KeyRound, Phone, Receipt, Sparkles } from 'lucide-react';
 import WordImport from './components/WordImport';
@@ -394,13 +394,15 @@ export default function App() {
   const [, setToken] = useState(() => localStorage.getItem('token') || null);
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'dark');
   const [gate, setGate] = useState(undefined); // undefined = loading; {activated, onboardingDone}
+  const gateRef = useRef(gate);
+  gateRef.current = gate;
 
   const loadGate = useCallback(() => {
     fetch(`${API_BASE}/onboarding/status`)
       // Moved to the cloud: the local API answers 423 here too, but the licence
       // status stays open and says where the office went.
       .then((r) => (r.status === 423
-        ? fetch(`${API_BASE}/license/status`).then((l) => l.json()).then((license) => ({ activated: false, onboardingDone: true, license }))
+        ? fetch(`${API_BASE}/license/status`).then((l) => l.json()).then((license) => ({ activated: !!license.activated, onboardingDone: true, license }))
         : r.json()))
       .then(setGate)
       // Only the very first load falls back to "not activated"; a failed
@@ -411,8 +413,14 @@ export default function App() {
 
   // Any API call answered 423 (the office moved while a window was open): re-read the gate now.
   useEffect(() => {
-    window.addEventListener(MOVED_EVENT, loadGate);
-    return () => window.removeEventListener(MOVED_EVENT, loadGate);
+    // Already on the cloud screen: nothing to re-read (belt and braces against a request loop).
+    const onMoved = () => {
+      const g = gateRef.current;
+      if (g && g.license && g.license.reason === 'moved_to_cloud') return;
+      loadGate();
+    };
+    window.addEventListener(MOVED_EVENT, onMoved);
+    return () => window.removeEventListener(MOVED_EVENT, onMoved);
   }, [loadGate]);
 
   // Re-read the licence every few minutes: a trial that runs out while the app

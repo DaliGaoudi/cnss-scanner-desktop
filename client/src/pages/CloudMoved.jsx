@@ -7,7 +7,9 @@ import API_BASE from '../config';
 // the local API answers 423 (see server/index.js). `license` is the server's
 // getStatus() with reason 'moved_to_cloud' (movedToCloud.url, providerContact).
 export default function CloudMoved({ license = {}, onUnlocked }) {
-  const url = license.movedToCloud && license.movedToCloud.url;
+  // Only ever open an https link (the server also refuses to store anything else).
+  const rawUrl = license.movedToCloud && license.movedToCloud.url;
+  const url = /^https:\/\//i.test(rawUrl || '') ? rawUrl : '';
 
   // The provider may have undone the move: ask once on our own so the app
   // unlocks without a restart. Silent, no control on screen.
