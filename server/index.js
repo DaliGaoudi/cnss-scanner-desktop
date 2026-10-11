@@ -59,10 +59,17 @@ function startServer({ port = 0, clientDist } = {}) {
     return new Promise((resolve, reject) => {
         const app = createApp({ clientDist });
         const server = app.listen(port, '127.0.0.1', () => {
-            // Re-validate the license in the background (honours revocation/transfer).
-            try { require('./license').revalidate().catch(() => {}); } catch (e) { /* ignore */ }
-            // Pull the latest shared records so this device opens up to date.
-            try { require('./sync').pull().catch(() => {}); } catch (e) { /* ignore */ }
+            // At launch, in the background (never blocks listen, never crashes it):
+            // re-validate the licence (honours revocation/transfer), pull the latest
+            // shared records so this device opens up to date, and once both are done
+            // reconcile the Word-import templates with the licence server's copies.
+            try {
+                const revalidating = require('./license').revalidate().catch(() => {});
+                const pulling = require('./sync').pull().catch(() => {});
+                Promise.all([revalidating, pulling])
+                    .then(() => require('./templateSync').syncOnLaunch())
+                    .catch(() => {});
+            } catch (e) { /* ignore */ }
             resolve(server);
         });
         server.on('error', reject);

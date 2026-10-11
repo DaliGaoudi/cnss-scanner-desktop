@@ -7,6 +7,7 @@ const multer = require('multer');
 const authenticate = require('../middleware/auth');
 const { getConfig, updateConfig, templatePath, listTemplatePath, importDir } = require('../config');
 const license = require('../license');
+const templateSync = require('../templateSync');
 const { build } = require('../services/templateImport');
 const { renderActs, SAMPLE_ACT } = require('../services/actRender');
 const { renderMonthlyList } = require('../services/listRender');
@@ -108,6 +109,7 @@ router.post('/apply', authenticate, (req, res) => {
     fs.copyFileSync(pendingFile('source.docx'), path.join(importDir(), 'source.docx'));
     fs.rmSync(pendingDir(), { recursive: true, force: true });
     updateConfig({ wordImportOffered: true });
+    templateSync.pushAll().catch(() => {}); // best-effort: the office's other PCs and the cloud get the same look
     res.json({ ok: true, active: readJson(activeReport()) });
 });
 
@@ -120,6 +122,7 @@ router.delete('/pending', authenticate, (req, res) => {
 // Back to the standard look: the bundled act and monthly bill.
 router.delete('/', authenticate, (req, res) => {
     for (const p of [templatePath(), listTemplatePath(), activeReport()]) if (fs.existsSync(p)) fs.unlinkSync(p);
+    templateSync.pushAll().catch(() => {}); // both files are gone → the server drops its copies too
     res.json({ ok: true });
 });
 
