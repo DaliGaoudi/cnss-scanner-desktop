@@ -10,6 +10,7 @@ const Docxtemplater = require('docxtemplater');
 const authenticate = require('../middleware/auth');
 const { getConfig, setPassword, updateConfig, templatePath, officeProfile, OFFICE_FIELDS, DEFAULT_PASSWORD } = require('../config');
 const license = require('../license');
+const templateSync = require('../templateSync');
 const { sampleActBuffer } = require('../services/actRender');
 const { openDocx } = require('../services/openDoc');
 
@@ -125,6 +126,7 @@ router.post('/template', authenticate, upload.single('file'), (req, res) => {
     if (err) return res.status(422).json({ error: err });
     try {
         fs.writeFileSync(templatePath(), req.file.buffer);
+        templateSync.pushKind('act').catch(() => {}); // best-effort: keeps the licence server's copy in step
         res.json({ success: true, hasCustomTemplate: true });
     } catch (e) {
         res.status(500).json({ error: 'تعذّر حفظ النموذج: ' + e.message });
@@ -135,6 +137,7 @@ router.post('/template', authenticate, upload.single('file'), (req, res) => {
 router.delete('/template', authenticate, (req, res) => {
     try {
         if (fs.existsSync(templatePath())) fs.unlinkSync(templatePath());
+        templateSync.pushKind('act').catch(() => {}); // the file is gone → the server drops its copy too
         res.json({ success: true, hasCustomTemplate: false });
     } catch (e) {
         res.status(500).json({ error: 'تعذّر الحذف: ' + e.message });

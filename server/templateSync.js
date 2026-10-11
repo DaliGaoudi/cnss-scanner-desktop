@@ -20,6 +20,13 @@ const license = require('./license');
  * Everything is best-effort and fails open: offline, a 5xx, a bad download or a
  * moved licence leaves the local files exactly as they were and is retried on
  * the next launch. A 410 records the move (the office is locked) and stops.
+ *
+ * Per template (act, list) config.json keeps `templateSync[kind].lastSyncedSha`:
+ * the sha256 (or null = absent) both sides agreed on at the last CONFIRMED push or
+ * download. With L = local sha, S = server sha, B = that remembered sha, launch
+ * can tell who changed what, so an unpushed local change is never overwritten and
+ * a failed delete never comes back. See reconcile(). Before a local template is
+ * overwritten or deleted it is copied to <dataDir>/backups/templates/ (kept).
  */
 
 const KINDS = ['act', 'list'];
@@ -58,9 +65,33 @@ async function call(c, route, extra = {}) {
     return res.json();
 }
 
-// "Synced before" is what tells a server-side deletion apart from a backfill.
-const markSynced = () => { try { config.updateConfig({ templatesSyncedAt: new Date().toISOString() }); } catch (e) { /* ignore */ } };
-const forgetSynced = () => { try { config.updateConfig({ templatesSyncedAt: null }); } catch (e) { /* ignore */ } };
+// ── Per-template sync state: config.templateSync[kind].lastSyncedSha ──
+// undefined = never synced; null = both sides had none; string = the agreed sha.
+// The pre-release flag `templatesSyncedAt` is dropped: those PCs count as never synced.
+function migrate() {
+    const cfg = config.getConfig();
+    if ('templatesSyncedAt' in cfg) {
+        delete cfg.templatesSyncedAt;
+        config.updateConfig({});
+    }
+}
+const lastSynced = (kind) => {
+    const e = (config.getConfig().templateSync || {})[kind];
+    return e && e.lastSyncedSha !== undefined ? e.lastSyncedSha : undefined;
+};
+const setLastSynced = (kind, sha) => {
+    try {
+        config.updateConfig({ templateSync: { ...(config.getConfig().templateSync || {}), [kind]: { lastSyncedSha: sha } } });
+    } catch (e) { /* ignore */ }
+};
+
+// Copy a local template aside before it is overwritten or deleted. Never deleted.
+function backup(kind, buf, suffix = '') {
+    const dir = path.join(config.dataDir(), 'backups', 'templates');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.writeFileSync(path.join(dir, `${stamp}_${kind}${suffix}.docx`), buf);
+}
 
 // Replace a local template atomically (a crash never leaves half a docx).
 function writeLocal(kind, buf) {
@@ -86,11 +117,8 @@ async function pushKindNow(kind) {
     const buf = readLocal(kind);
     try {
         await call(c, 'push', { kind, docxBase64: buf ? buf.toString('base64') : null });
-    } catch (e) {
-        // The server doesn't have this change. Forget "synced" so the next launch
-        // treats the file as a backfill (re-upload) instead of a server deletion.
-        if (!(e instanceof Gone)) forgetSynced();
-    }
+        setLastSynced(kind, buf ? sha256(buf) : null); // confirmed: the server has exactly this
+    } catch (e) { /* not confirmed: the remembered sha stays, so the next launch pushes it again */ }
 }
 
 // Send this kind's local file up (an absent file sends null = delete). Never throws.
@@ -98,15 +126,71 @@ const pushKind = (kind) => serialized(() => pushKindNow(kind)).catch(() => {});
 // Push both kinds, e.g. after «اعتماد» or «العودة للشكل القياسي».
 const pushAll = () => serialized(async () => { for (const k of KINDS) await pushKindNow(k); }).catch(() => {});
 
-// Fetch one kind and keep it only if it really is the announced docx.
-async function download(c, meta) {
+// Fetch one kind; null unless it really is the announced docx.
+async function fetchServerCopy(c, meta) {
     const d = await call(c, `pull/${meta.kind}`);
-    if (!d || typeof d.docxBase64 !== 'string') return false;
+    if (!d || typeof d.docxBase64 !== 'string') return null;
     const buf = Buffer.from(d.docxBase64, 'base64');
-    if (buf.length < 4 || !buf.subarray(0, 4).equals(ZIP_MAGIC)) return false;
-    if (sha256(buf) !== meta.sha256) return false;
-    writeLocal(meta.kind, buf);
+    if (buf.length < 4 || !buf.subarray(0, 4).equals(ZIP_MAGIC)) return null;
+    return sha256(buf) === meta.sha256 ? buf : null;
+}
+
+// Take the server's copy (backing up what it replaces). False when the download is unusable.
+async function takeServer(c, kind, meta, out) {
+    const buf = await fetchServerCopy(c, meta);
+    if (!buf) return false;
+    const local = readLocal(kind);
+    if (local) backup(kind, local);
+    writeLocal(kind, buf);
+    setLastSynced(kind, meta.sha256);
+    out.downloaded.push(kind);
     return true;
+}
+
+// Send the local state up: its bytes, or null when the local file is absent.
+async function sendLocal(c, kind, local, out) {
+    await call(c, 'push', { kind, docxBase64: local ? local.toString('base64') : null });
+    setLastSynced(kind, local ? sha256(local) : null);
+    out.uploaded.push(kind);
+}
+
+// Both sides changed since they last agreed: the newer write wins, the loser is backed up.
+// A side that is simply absent never beats one that exists (nothing is destroyed).
+async function bothChanged(c, kind, local, meta, out) {
+    if (!local) return takeServer(c, kind, meta, out);
+    if (!meta) { await sendLocal(c, kind, local, out); return true; }
+    const serverAt = Date.parse(meta.uploadedAt);
+    const localAt = fs.statSync(localPath(kind)).mtimeMs;
+    if (Number.isFinite(serverAt) && serverAt > localAt) return takeServer(c, kind, meta, out);
+    const theirs = await fetchServerCopy(c, meta);
+    if (theirs) backup(kind, theirs, '_server');
+    await sendLocal(c, kind, local, out);
+    return true;
+}
+
+// One kind: L = local sha, S = server sha, B = last confirmed sha. Returns false on a failure
+// that should keep the remembered state (retried next launch).
+async function reconcile(c, kind, meta, out) {
+    const local = readLocal(kind);
+    const L = local ? sha256(local) : null;
+    const S = meta ? meta.sha256 : null;
+    const B = lastSynced(kind);
+    if (L === S) { if (B !== L) setLastSynced(kind, L); return true; }
+    if (B === undefined) {                       // never synced on this PC
+        if (S) return takeServer(c, kind, meta, out);
+        await sendLocal(c, kind, local, out);    // server lacks it, local has it: backfill
+        return true;
+    }
+    if (L === B) {                               // only the server changed
+        if (S) return takeServer(c, kind, meta, out);
+        backup(kind, local);                     // deleted on the server (L is B, non-null here)
+        fs.unlinkSync(localPath(kind));
+        setLastSynced(kind, null);
+        out.deleted.push(kind);
+        return true;
+    }
+    if (S === B) { await sendLocal(c, kind, local, out); return true; }  // only this PC changed
+    return bothChanged(c, kind, local, meta, out);
 }
 
 async function syncOnLaunchNow() {
@@ -115,32 +199,18 @@ async function syncOnLaunchNow() {
     const c = ctx();
     if (!c) return out;
     try {
+        migrate();
         const listing = await call(c, 'pull');
         if (!listing || !Array.isArray(listing.templates)) return out;
         const onServer = new Map(listing.templates.map((t) => [t.kind, t]));
-        const syncedBefore = !!config.getConfig().templatesSyncedAt;
-        let failed = false;
         for (const kind of KINDS) {
             try {
-                const meta = onServer.get(kind);
-                const local = readLocal(kind);
-                if (meta) {
-                    if (!local || sha256(local) !== meta.sha256) {
-                        if (await download(c, meta)) out.downloaded.push(kind); else failed = true;
-                    }
-                } else if (local && syncedBefore) {
-                    fs.unlinkSync(localPath(kind));            // deleted on the server since the last sync
-                    out.deleted.push(kind);
-                } else if (local) {
-                    await call(c, 'push', { kind, docxBase64: local.toString('base64') });
-                    out.uploaded.push(kind);                   // approved before this release: backfill once
-                }
+                await reconcile(c, kind, onServer.get(kind) || null, out);
             } catch (e) {
                 if (e instanceof Gone) return out;
-                failed = true;                                  // keep the local file; retry next launch
+                // keep the local file and the remembered sha; retry next launch
             }
         }
-        if (!failed) markSynced();
     } catch (e) { /* offline or a 5xx: keep everything, retry next launch */ }
     return out;
 }
