@@ -1,0 +1,16 @@
+node_modules/
+client/node_modules/
+client/dist/
+dist/
+server/.userdata/
+*.log
+scan-watcher/bridge.pid
+
+.vercel
+
+# Local tooling and machine state (not part of the app)
+graphify-out/
+~$*
+*.db
+*.sqlite
+scan-watcher/config.json
