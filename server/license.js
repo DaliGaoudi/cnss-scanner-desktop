@@ -57,6 +57,25 @@ function fingerprint() {
     return _fp;
 }
 
+// ── Moved to the cloud ──
+// The provider moved this office to the web app. We keep the key and token (so an
+// undo unlocks on the next good validate) and only record where the office went.
+// Local files are never touched.
+function markMoved({ url, at, providerContact } = {}) {
+    const lic = load();
+    const prev = lic.movedToCloud || {};
+    save({
+        ...lic,
+        movedToCloud: { url: url || prev.url || '', at: at || prev.at || new Date().toISOString() },
+        providerContact: providerContact || lic.providerContact || '',
+    });
+}
+function clearMoved() {
+    const { movedToCloud, ...rest } = load();
+    if (movedToCloud) save(rest);
+}
+const isMoved = () => load().movedToCloud || null;
+
 // ── Offline status: verify the stored token with the embedded public key ──
 // A trial's token expires exactly when the trial does, so this alone locks an
 // expired trial — no network needed. `trialExpired` is set when the server said
@@ -64,6 +83,8 @@ function fingerprint() {
 function getStatus() {
     const lic = load();
     const base = { licenseKey: lic.licenseKey || '', providerContact: lic.providerContact || '' };
+    // A moved office sees the cloud screen, never a payment or activation one.
+    if (lic.movedToCloud) return { activated: false, reason: 'moved_to_cloud', movedToCloud: lic.movedToCloud, ...base };
     if (!lic.token) return { activated: false, ...base };
     try {
         const claims = jwt.verify(lic.token, LICENSE_PUBLIC_KEY, { algorithms: ['RS256'] });
@@ -112,6 +133,10 @@ async function activate(licenseKey) {
         body: JSON.stringify({ licenseKey: String(licenseKey || '').trim(), fingerprint: fp, appVersion: APP_VERSION }),
     });
     const d = await res.json().catch(() => ({}));
+    if (res.status === 403 && d.reason === 'moved_to_cloud') {
+        markMoved({ url: d.cloudUrl, at: d.movedAt, providerContact: d.providerContact });
+        throw new Error(`تم نقل مكتبكم إلى السحابة. افتحوا التطبيق على: ${d.cloudUrl || ''}`.trim());
+    }
     if (!res.ok) throw new Error(d.error || 'فشل التفعيل. تحقّق من المفتاح والاتصال بالإنترنت.');
     save({
         licenseKey: String(licenseKey).trim(), token: d.token, fingerprint: fp, lastValidated: Date.now(),
@@ -141,6 +166,8 @@ async function revalidate() {
         const d = await res.json().catch(() => ({}));
         if (res.status === 403) {
             const providerContact = d.providerContact || lic.providerContact || '';
+            // Moved to the cloud: keep key + token (an undo unlocks on the next good validate).
+            if (d.reason === 'moved_to_cloud') { markMoved({ url: d.cloudUrl, at: d.movedAt, providerContact }); return; }
             // Trial over: keep the key + token so the lock screen can offer
             // "check again" once the customer has paid.
             if (d.reason === 'trial_expired') { save({ ...lic, trialExpired: true, providerContact }); return; }
@@ -149,9 +176,10 @@ async function revalidate() {
             return;
         }
         if (res.ok && d.token) {
-            const { trialExpired, ...rest } = lic;
+            const { trialExpired, movedToCloud, ...rest } = lic;
             save({ ...rest, token: d.token, lastValidated: Date.now(), providerContact: d.providerContact || lic.providerContact || '' });
             applyRemoteDetails(d.details); // keep letterhead in sync across the customer's devices
+            if (movedToCloud) { try { require('./sync').resume(); } catch (e) { /* best-effort */ } } // undo: pushing may resume
         }
     } catch (e) { /* offline: keep token */ }
 }
@@ -265,6 +293,6 @@ function activationContext() {
 }
 
 module.exports = {
-    fingerprint, getStatus, activate, revalidate, activationContext, pushProfile, serverUrl, leave,
+    fingerprint, getStatus, load, markMoved, clearMoved, isMoved, activate, revalidate, activationContext, pushProfile, serverUrl, leave,
     passwordResetRequest, passwordResetStatus, passwordResetConsume, templateMap,
 };

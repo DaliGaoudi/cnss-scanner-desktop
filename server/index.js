@@ -21,6 +21,15 @@ function createApp({ clientDist } = {}) {
         next();
     });
 
+    // Moved to the cloud: the local API is shut except what the lock screen needs
+    // (licence status/refresh, health). No edit can succeed, even from an open window.
+    const OPEN_WHEN_MOVED = new Set(['/health', '/license/status', '/license/refresh']);
+    app.use('/api', (req, res, next) => {
+        const moved = require('./license').isMoved();
+        if (!moved || OPEN_WHEN_MOVED.has(req.path)) return next();
+        res.status(423).json({ code: 'moved_to_cloud', cloudUrl: moved.url });
+    });
+
     app.use('/api/auth', require('./routes/auth'));
     app.use('/api/license', require('./routes/license'));
     app.use('/api/onboarding', require('./routes/onboarding'));

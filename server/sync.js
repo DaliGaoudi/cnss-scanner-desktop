@@ -83,6 +83,18 @@ function buildSnapshot() {
 
 let _syncing = false;
 
+// Set when the server answers 410: the licence moved to the cloud. No more pushes
+// this process; resume() clears it when a later validate says the move was undone.
+let _moved = false;
+const resume = () => { _moved = false; };
+
+// A 410 from the server: record the move (the office is locked) and stop pushing.
+async function onGone(res) {
+    const d = await res.json().catch(() => ({}));
+    license.markMoved({ url: d && d.cloudUrl });
+    _moved = true;
+}
+
 // ── Pull the latest snapshot and apply it if newer than what we last saw. ──
 async function pull() {
     const c = ctx();
@@ -110,7 +122,7 @@ async function pull() {
 //    shrink-guard, pause auto-push and record it for the user to resolve. ──
 async function push() {
     const c = ctx();
-    if (!c || _syncing) return;
+    if (!c || _syncing || _moved || license.isMoved()) return;
     if (getGuard()) return;        // paused: local looks wiped, waiting for the user
     _syncing = true;
     try {
@@ -121,6 +133,9 @@ async function push() {
         if (res.ok) {
             const d = await res.json().catch(() => ({}));
             if (d && d.version) setVersion(d.version);
+        } else if (res.status === 410) {
+            await onGone(res);
+            return;
         } else if (res.status === 409) {
             _syncing = false;          // release before re-entering pull()
             await pull();
@@ -200,7 +215,7 @@ async function resolvePullServer() {
 // guard on success. Guarded in the UI behind a scary confirmation.
 async function resolveForceOverwrite() {
     const c = ctx();
-    if (!c || _syncing) return { ok: false };
+    if (!c || _syncing || _moved || license.isMoved()) return { ok: false };
     _syncing = true;
     try {
         const res = await fetch(`${license.serverUrl()}/api/data/push`, {
@@ -216,6 +231,7 @@ async function resolveForceOverwrite() {
             setGuard(null);
             return { ok: true };
         }
+        if (res.status === 410) { await onGone(res); return { ok: false }; }
         if (res.status === 409) {
             // The server moved on since the guard was set — safer to pull than to
             // clobber a now-newer snapshot. Fall back to taking the server copy.
@@ -230,6 +246,6 @@ async function resolveForceOverwrite() {
 }
 
 module.exports = {
-    pull, push, pushSoon, syncNow, flush, cancelPending,
+    pull, push, pushSoon, resume, syncNow, flush, cancelPending,
     guardState: getGuard, resolvePullServer, resolveForceOverwrite,
 };
